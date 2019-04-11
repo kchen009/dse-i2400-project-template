@@ -5,7 +5,6 @@ import {
   ForbiddenError,
 } from 'apollo-server';
 import _ from 'lodash';
-import bcrypt from 'bcryptjs';
 import crypto from 'crypto';
 import jwt from 'jsonwebtoken';
 
@@ -122,6 +121,32 @@ const typeDefs = gql`
   }
 `;
 
+class UserSessions {
+  userSessions = [];
+  nextID = 0;
+
+  getSession(sessionID) {
+    const i = _.findIndex(this.userSessions, u => u.id === sessionID);
+    return i === -1 ? null : this.userSessions[i];
+  }
+
+  createSession(userID, secret, expiresIn = 60 * 10) {
+    const session = { id: this.nextID, userID: userID };
+    this.nextID++;
+
+    const token = jwt.sign({ id: userID, sessionID: session.id }, secret, {
+      expiresIn,
+    });
+
+    this.userSessions.push(session);
+    return token;
+  }
+
+  invalidateSession(sessionID) {
+    this.userSessions = _.remove(this.userSessions, s => s.id === sessionID);
+  }
+}
+
 class Users {
   constructor() {
     this.nextID = 3;
@@ -186,23 +211,29 @@ class Users {
   };
 
   login(emailAddress, password) {
-    //    throw new AuthenticationError('No such user found');
+    // does a user with the specified emailAddress exist?
     const i = this.users.findIndex(({ email }) => email === emailAddress);
     if (i === -1) {
       throw new AuthenticationError('User not Found');
     }
 
     const user = this.users[i];
+
+    // hash the password with the user salt
     const hashedPassword = this.sha512(password, user.salt).passwordHash;
 
+    // compare the hashed password against the one in the user record
     if (hashedPassword !== user.passwordHash) {
       console.log(hashedPassword);
       console.log(user);
       throw new AuthenticationError('Bad Login or Password');
     }
+
+    // create a jwt token and store
+    //
     return {
-      user: _.omit(this.users[i], ['passwordHash', 'salt']),
-      token: jwt.sign({ id: user.id }, APP_SECRET, { expiresIn: 3 * 60 }),
+      user: _.omit(user, ['passwordHash', 'salt']),
+      token: userSessions.createSession(user.id, APP_SECRET),
     };
   }
 
@@ -242,8 +273,8 @@ class Users {
 }
 
 const users = new Users();
+const userSessions = new UserSessions();
 
-// Provide resolver functions for your schema fields
 // Middleware function to authenticate and authorize the user
 // Takes a resolver function and returns an adorned resolver
 // that authenticates the user and then checks whether the
@@ -266,6 +297,7 @@ const makeResolver = (resolver, options) => {
     const { requireUser } = o;
     const { roles } = o;
     let user = null;
+    let sessionID = null;
 
     if (requireUser) {
       // get the token from the request
@@ -275,7 +307,7 @@ const makeResolver = (resolver, options) => {
       }
 
       // retrieve the user given the token
-      user = getUserForToken(token);
+      [user, sessionID] = getUserForToken(token);
       if (!user) {
         throw new AuthenticationError('Invalid Token or User');
       }
@@ -288,7 +320,12 @@ const makeResolver = (resolver, options) => {
     }
 
     // call the passed resolver with context extended with user
-    return resolver(root, args, { ...context, user: user }, info);
+    return resolver(
+      root,
+      args,
+      { ...context, user: user, sessionID: sessionID },
+      info,
+    );
   };
 };
 
@@ -306,8 +343,9 @@ const resolvers = {
       { requireUser: false },
     ),
     logoutUser: makeResolver((root, args, context, info) => {
-      const user = context.user;
-      return users.logout(user.id);
+      const sessionID = context.sessionID;
+      userSessions.invalidateSession(sessionID);
+      return true;
     }),
   },
   User: {
@@ -330,11 +368,28 @@ const resolvers = {
 
 const getUserForToken = token => {
   try {
-    const { id } = jwt.verify(token, APP_SECRET);
+    const { id, sessionID } = jwt.verify(token, APP_SECRET);
     const user = users.get(id);
 
-    return user;
+    // get the user session
+    // note: a better way to do this with a database is to
+    // join the Users table with the UserSessions table on
+    // users.id = user_sessions.user_id where session_id = sessionID
+    // this would get both the user and the sessionID in one query
+    const session = userSessions.getSession(sessionID);
+    if (!session) {
+      // If the session doesn't exist, it's been invalidated
+      throw new AuthenticationError('Invalid Session');
+    }
+
+    return [user, session.id];
   } catch (error) {
+    if (error instanceof jwt.TokenExpiredError) {
+      // invalidate the sesssion if expired
+      const { sessionID } = jwt.decode(token);
+      userSessions.invalidateSession(sessionID);
+      throw new AuthenticationError('Session Expired');
+    }
     throw new AuthenticationError('Bad Token');
   }
 };
